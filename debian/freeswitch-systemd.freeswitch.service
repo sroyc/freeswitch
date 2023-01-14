@@ -9,18 +9,25 @@ After=network.target network-online.target local-fs.target
 [Service]
 ; service
 Type=forking
-PIDFile=/run/freeswitch/freeswitch.pid
-Environment="DAEMON_OPTS=-nonat"
-Environment="USER=freeswitch"
-Environment="GROUP=freeswitch"
+; PIDFile=/run/freeswitch/freeswitch.pid
+PIDFile=/usr/local/freeswitch/run/freeswitch.pid
+Environment="DAEMON_OPTS=-nonat -rp"
+Environment="USER=sidroyc"
+Environment="GROUP=sidroyc"
 EnvironmentFile=-/etc/default/freeswitch
-ExecStartPre=/bin/chown -R ${USER}:${GROUP} /var/lib/freeswitch /var/log/freeswitch /etc/freeswitch /usr/share/freeswitch /var/run/freeswitch
-ExecStart=/usr/bin/freeswitch -u ${USER} -g ${GROUP} -ncwait ${DAEMON_OPTS}
-TimeoutSec=45s
-Restart=always
+; ExecStartPre=/bin/chown -R ${USER}:${GROUP} /var/lib/freeswitch /var/log/freeswitch /etc/freeswitch /usr/share/freeswitch /var/run/freeswitch
+ExecStart=
+ExecStart=/usr/local/freeswitch/bin/freeswitch -u sidroyc -g sidroyc -ncwait -nonat -rp
+; TimeoutSec=45s
+TimeoutStartSec=45
+TimeoutStopSec=45
+Restart=on-failure
 ; exec
-;User=${USER}
-;Group=${GROUP}
+WorkingDirectory=/usr/local/freeswitch/bin
+User=root
+Group=daemon
+; User=sidroyc
+; Group=sidroyc
 LimitCORE=infinity
 LimitNOFILE=100000
 LimitNPROC=60000
