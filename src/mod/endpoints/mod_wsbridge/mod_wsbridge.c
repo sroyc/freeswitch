@@ -82,6 +82,8 @@
 #define HEADER_WS_URI          "P-"WSBRIDGE_SIP_HEADER_TOKEN"-websocket-uri"
 #define HEADER_WS_HEADERS      "P-"WSBRIDGE_SIP_HEADER_TOKEN"-websocket-headers"
 #define HEADER_WS_CONT_TYPE    "P-"WSBRIDGE_SIP_HEADER_TOKEN"-websocket-content-type"
+#define WS_RECORD_DURATION_MS   "wsbridge_record_duration_ms"
+#define WS_ASR_RESPONSE         "wsbridge_asr_response"
 #define WS_URI_MAX_SIZE         2048
 #define WS_HEADERS_MAX_SIZE     1024
 #define WS_CONT_TYPE_MAX_SIZE   50
@@ -150,6 +152,7 @@ struct private_object {
 	switch_timer_t ws_timer;
 	cJSON* message;
 	char content_type[WS_CONT_TYPE_MAX_SIZE];
+	unsigned int record_duration_ms;
 	struct lws_context_creation_info info;
 	struct lws_client_connect_info i;
 	char path[2048];
@@ -524,7 +527,24 @@ wsbridge_callback_ws(struct lws *wsi, enum lws_callback_reasons reason,
 			}
 			switch_mutex_unlock(tech_pvt->read_mutex);
 		} else {
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "WebSockets RX: Frame not received in binary mode, will drop: [%s] \n", (char *)in);
+			cJSON *message = NULL;
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "WebSockets RX: received text: [%s] \n", (char *)in);
+			message = cJSON_Parse((char *)in);
+		        channel = switch_core_session_get_channel(session);
+			if (message != NULL) {
+				cJSON *asr = cJSON_GetObjectItem(message, "asr_response");
+				if (cJSON_IsString(asr) && (asr->valuestring != NULL)) {
+					switch_log_printf(
+						SWITCH_CHANNEL_LOG,
+						SWITCH_LOG_DEBUG,
+						"ASR response: [%s] WS message: [%s]\n",
+						asr->valuestring, (char *)in);
+					//switch_channel_set_variable(channel, WS_ASR_RESPONSE, asr->valuestring);
+					switch_channel_set_variable_partner(channel, WS_ASR_RESPONSE, asr->valuestring);
+					//switch_channel_export_variable(channel, WS_ASR_RESPONSE, asr->valuestring, SWITCH_BRIDGE_EXPORT_VARS_VARIABLE);
+				}
+			}
+		        switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
 		}
 			
 		n = lws_remaining_packet_payload(tech_pvt->wsi_wsbridge);
@@ -864,9 +884,15 @@ static switch_status_t channel_on_init(switch_core_session_t *session)
 			if (cJSON_GetObjectItem(json_req, "content-type")) {
 				cJSON_DeleteItemFromObject(json_req, "content-type");
 			}
+			if (cJSON_GetObjectItem(json_req, "record-duration-ms")) {
+				cJSON_DeleteItemFromObject(json_req, "record-duration-ms");
+			}
 			cJSON_Delete(tech_pvt->message);
 			tech_pvt->message = json_req;
 			cJSON_AddItemToObject(json_req, "content-type", cJSON_CreateString(tech_pvt->content_type));
+			if (tech_pvt->record_duration_ms > 0) {
+				cJSON_AddNumberToObject(json_req, "record-duration-ms", tech_pvt->record_duration_ms);
+			}
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "%s: tech_pvt->message = [%s]\n",
 							  __func__, cJSON_Print(tech_pvt->message));
 		}
@@ -1339,7 +1365,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		switch_caller_profile_t *caller_profile;
 		const char *prot, *p;
 		uint32_t use_ssl;
-		char *ws_uri = NULL , *ws_content_type = NULL , *ws_headers = NULL;
+		char *ws_uri = NULL , *ws_content_type = NULL , *ws_headers = NULL, *ws_record_duration_ms = NULL;
 		/* Maximum lenght for the headers field. */
 		char parsed_ws_headers[WS_HEADERS_MAX_SIZE];
 		struct lws_context *context;
@@ -1363,6 +1389,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			ws_uri =  (char*) switch_channel_get_variable(channel, HEADER_WS_URI);
 			ws_headers = (char*) switch_channel_get_variable(channel, HEADER_WS_HEADERS);
 			ws_content_type = (char*) switch_channel_get_variable(channel, HEADER_WS_CONT_TYPE);
+			ws_record_duration_ms = (char*) switch_channel_get_variable(channel, WS_RECORD_DURATION_MS);
 		}
 
 		if (!ws_uri) {
@@ -1396,10 +1423,11 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			switch_log_printf(
 				SWITCH_CHANNEL_SESSION_LOG(session),
 				SWITCH_LOG_INFO,
-				"SIP headers, URI [%s], HEADERS [%s], CONTENT-TYPE [%s]",
+				"SIP headers, URI [%s], HEADERS [%s], CONTENT-TYPE [%s] RECORD-DURATION [%s]",
 				ws_uri,
 				ws_headers,
-				ws_content_type);
+				ws_content_type,
+				ws_record_duration_ms);
 		}
 
 		/* Handle the URI (it's mandatory) */
@@ -1492,7 +1520,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 					L16_16000);
 			}
 			//wsbridge_strncpy_null_term(tech_pvt->content_type, L16_16000, WS_CONT_TYPE_MAX_SIZE);
-			wsbridge_strncpy_null_term(tech_pvt->content_type, L16_16000, strlen(L16_16000));
+			wsbridge_strncpy_null_term(tech_pvt->content_type, L16_16000, strlen(L16_16000) + 1);
 		} else {
 			switch_url_decode((char *)ws_content_type);
 			wsbridge_str_remove_quotes(ws_content_type);
@@ -1504,13 +1532,20 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			  (Content-Type := type "/" subtype *[";" parameter] )
 			*/
 			//wsbridge_strncpy_null_term(tech_pvt->content_type, ws_content_type, WS_CONT_TYPE_MAX_SIZE);
-			wsbridge_strncpy_null_term(tech_pvt->content_type, ws_content_type, strlen(ws_content_type));
+			wsbridge_strncpy_null_term(tech_pvt->content_type, ws_content_type, strlen(ws_content_type) + 1);
 		}
 
 		if (wsbridge_codecs_init(tech_pvt, *new_session)) {
 			/* The content type provided is not supported */
 			switch_core_session_destroy(new_session);
 			return SWITCH_CAUSE_SERVICE_NOT_IMPLEMENTED;
+		}
+
+		/* Handle the record duration ms parameter */
+		if (!zstr(ws_record_duration_ms)) {
+			tech_pvt->record_duration_ms = atoi(ws_record_duration_ms);
+		} else {
+			tech_pvt->record_duration_ms = 0;
 		}
 
 		if (tech_pvt->frame_sz) {
@@ -1547,8 +1582,13 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			json_req = cJSON_CreateObject();
 		}
 		cJSON_AddItemToObject(json_req, "content-type", cJSON_CreateString(tech_pvt->content_type));
+		if (tech_pvt->record_duration_ms > 0) {
+			cJSON_AddNumberToObject(json_req, "record-duration-ms", tech_pvt->record_duration_ms);
+		}
 
 		tech_pvt->message = json_req;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s: tech_pvt->message = [%s]\n",
+				  __func__, cJSON_Print(tech_pvt->message));
 
 		/* Set the actual thing up here */
 		if (lws_parse_uri((char*) ws_uri, &prot, &tech_pvt->i.address, &tech_pvt->i.port, &p)) {
@@ -1866,7 +1906,7 @@ static switch_status_t load_config(void)
 		}
 	}
 
-	globals.debug = 0; // turn it on for more debugging info  
+	globals.debug = 1; // turn it on for more debugging info  
 
 	if (!globals.dialplan) {
 		set_global_dialplan("default");
